@@ -1,0 +1,812 @@
+---
+title: "F1 Race Gap Prediction - XGBoost Model (Revised)"
+format: html
+---
+
+```{python}
+# ── Imports ───────────────────────────────────────────────────────────────────
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import xgboost as xgb
+from plotnine import *
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import TimeSeriesSplit, ParameterGrid
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.impute import SimpleImputer
+import shap
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+```
+
+```{python}
+# ── Load Data ─────────────────────────────────────────────────────────────────
+df = pd.read_csv('ClusteredResults.csv')
+print(f"Raw data shape: {df.shape}")
+print(f"Seasons: {sorted(df['Season'].unique())}")
+print(f"Races: {df.groupby(['Season','Round']).ngroups} total")
+```
+
+```{python}
+# ── Target Engineering: gap_to_winner_sec → gap_scaled ───────────────────────
+df['Time_td'] = pd.to_timedelta(df['Time'])
+df['Time_seconds'] = df['Time_td'].dt.total_seconds()
+
+# P1's time is full race duration — their gap is 0
+df['gap_to_winner_sec'] = df.apply(
+    lambda row: 0.0 if row['Position'] == 1.0 else row['Time_seconds'],
+    axis=1
+)
+
+# DNFs → NaN (we drop these later)
+df.loc[df['Status'] != 'Finished', 'gap_to_winner_sec'] = float('nan')
+
+# Log-transform before scaling to avoid compressing mid-pack variation
+# Add small epsilon to handle P1's 0 gap
+df['gap_log'] = np.log1p(df['gap_to_winner_sec'])
+
+# Scale within each race (MinMax on log-transformed gap)
+scaler = MinMaxScaler()
+
+def scale_within_race(group):
+    mask = ~group['gap_log'].isna()
+    vals = group.loc[mask, 'gap_log'].values.reshape(-1, 1)
+    if mask.sum() > 1:
+        group.loc[mask, 'gap_scaled'] = scaler.fit_transform(vals).flatten()
+    else:
+        group['gap_scaled'] = float('nan')
+    return group
+
+df = df.groupby(['Season', 'Round'], group_keys=False).apply(scale_within_race)
+
+print(df[['FullName', 'Season', 'Round', 'Position', 'gap_to_winner_sec', 'gap_scaled']].head(20))
+```
+
+```{python}
+# ── Quali Gap Feature ─────────────────────────────────────────────────────────
+def add_quali_gap(group):
+    pole_time = group.loc[group['GridPosition'] == 1.0, 'AvgQualiTime'].values
+    if len(pole_time) > 0 and not pd.isna(pole_time[0]):
+        group['AvgQualiTime_gap'] = group['AvgQualiTime'] - pole_time[0]
+    else:
+        group['AvgQualiTime_gap'] = float('nan')
+    return group
+
+df = df.groupby(['Season', 'Round'], group_keys=False).apply(add_quali_gap)
+
+# Scale quali gap within race as well
+def scale_quali_gap(group):
+    mask = ~group['AvgQualiTime_gap'].isna()
+    vals = group.loc[mask, 'AvgQualiTime_gap'].values.reshape(-1, 1)
+    if mask.sum() > 1:
+        group.loc[mask, 'AvgQualiTime_gap_scaled'] = scaler.fit_transform(vals).flatten()
+    else:
+        group['AvgQualiTime_gap_scaled'] = float('nan')
+    return group
+
+df = df.groupby(['Season', 'Round'], group_keys=False).apply(scale_quali_gap)
+```
+
+```{python}
+# ── Driver & Team Historical Features ────────────────────────────────────────
+# Sort chronologically before computing rolling stats
+df = df.sort_values(['Season', 'Round', 'Position']).reset_index(drop=True)
+
+# Create a race-order index for clean rolling calculations
+df['race_order'] = df['Season'] * 100 + df['Round']
+
+# Rolling 5-race avg finish position per driver (shift to avoid leakage)
+df['driver_avg_finish_5'] = (
+    df.groupby('DriverId')['Position']
+    .transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
+)
+
+# Rolling 5-race DNF rate per driver
+df['finished_flag'] = (df['Status'] == 'Finished').astype(float)
+df['driver_dnf_rate_5'] = (
+    df.groupby('DriverId')['finished_flag']
+    .transform(lambda x: 1 - x.shift(1).rolling(5, min_periods=1).mean())
+)
+
+# Rolling 5-race avg points per driver (proxy for current form)
+df['driver_avg_points_5'] = (
+    df.groupby('DriverId')['Points']
+    .transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
+)
+
+# Team rolling avg finish position (5 races, per TeamId)
+df['team_avg_finish_5'] = (
+    df.groupby('TeamId')['Position']
+    .transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
+)
+
+# Team rolling avg points (5 races)
+df['team_avg_points_5'] = (
+    df.groupby('TeamId')['Points']
+    .transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
+)
+
+print("Driver/team features created.")
+print(df[['FullName', 'Season', 'Round', 'driver_avg_finish_5', 'driver_avg_points_5', 'team_avg_finish_5']].head(20))
+```
+
+```{python}
+# ── One-Hot Encode Categoricals ───────────────────────────────────────────────
+df = pd.get_dummies(df, columns=['circuit_name', 'track_type'], dtype=int)
+```
+
+```{python}
+# ── Drop Target-Leaking & ID Columns ─────────────────────────────────────────
+drop_cols = [
+    # Identifiers
+    'DriverNumber', 'BroadcastName', 'Abbreviation', 'DriverId', 'TeamName',
+    'TeamColor', 'TeamId', 'FirstName', 'LastName', 'FullName',
+    'HeadshotUrl', 'CountryCode',
+    # Raw target & intermediate derivations
+    'Position', 'ClassifiedPosition', 'Time', 'Time_td', 'Time_seconds',
+    'gap_to_winner_sec', 'gap_log',
+    'Q1', 'Q2', 'Q3', 'Status', 'Points', 'Laps',
+    'finished_flag', 'race_order',
+    # Replaced by gap version
+    'AvgQualiTime',
+    # HDBSCAN is all -1 (useless), keep kmeans
+    'hdbscan',
+    # Grand prix info already captured in circuit_name dummies
+    'grand_prix', 'country', 'circuit_id',
+    # Scaled quali gap replaces raw gap
+    'AvgQualiTime_gap',
+]
+
+# Drop target-leaking columns and rows with missing target
+df_model = df.dropna(subset=['gap_scaled']).copy()
+df_model = df_model.drop(columns=[c for c in drop_cols if c in df_model.columns])
+
+print(f"Model dataset shape: {df_model.shape}")
+print(f"Remaining columns: {df_model.columns.tolist()}")
+```
+
+```{python}
+# ── Feature Matrix & Target ───────────────────────────────────────────────────
+X = df_model.drop(columns=['gap_scaled'])
+y = df_model['gap_scaled']
+
+# Impute any remaining NaNs (rolling features will have NaN for first few races)
+imputer = SimpleImputer(strategy='mean')
+X_imputed = pd.DataFrame(imputer.fit_transform(X), columns=X.columns, index=X.index)
+
+print(f"X shape: {X_imputed.shape}")
+print(f"y shape: {y.shape}")
+print(f"NaN count in X after imputation: {X_imputed.isna().sum().sum()}")
+```
+
+```{python}
+# ── Temporal Train / Test Split ───────────────────────────────────────────────
+# NOTE: We use temporal splitting throughout — NO random shuffle
+# Training: 2023-2024 | Test: 2025
+season_mask = df_model['Season']
+
+X_train = X_imputed[season_mask < 2025]
+X_test  = X_imputed[season_mask == 2025]
+y_train = y[season_mask < 2025]
+y_test  = y[season_mask == 2025]
+
+print(f"Train size: {X_train.shape[0]} rows | Test size: {X_test.shape[0]} rows")
+```
+
+```{python}
+# ── XGBoost DMatrix ───────────────────────────────────────────────────────────
+dtrain = xgb.DMatrix(data=X_train.values, label=y_train)
+dtest  = xgb.DMatrix(data=X_test.values,  label=y_test)
+```
+
+```{python}
+# ── Temporal Cross-Validation Setup ──────────────────────────────────────────
+# Build race-level time index so folds respect chronological order
+# We use the Season+Round from df_model aligned to X_train
+train_race_ids = (df_model.loc[X_train.index, 'Season'] * 100 +
+                  df_model.loc[X_train.index, 'Round']).values
+unique_races_sorted = np.sort(np.unique(train_race_ids))
+n_races = len(unique_races_sorted)
+print(f"Training races for CV: {n_races}")
+
+# Assign each row a fold index based on race order (5 folds)
+N_FOLDS = 5
+race_to_fold = {r: int(i * N_FOLDS / n_races) for i, r in enumerate(unique_races_sorted)}
+fold_idx = np.array([race_to_fold[r] for r in train_race_ids])
+
+# Build custom fold indices for xgb.cv (list of (train_idx, val_idx) tuples)
+# xgb.cv doesn't natively support custom folds easily — we'll use sklearn loop instead
+def temporal_cv_xgb(params, X_tr, y_tr, fold_idx, n_folds, num_rounds, early_stop):
+    """
+    Run XGBoost CV with temporal (forward-chaining) folds.
+    Returns DataFrame with mean/std test RMSE per round (like xgb.cv output).
+    """
+    fold_results = []
+    
+    for fold in range(1, n_folds):  # forward-chaining: train on folds 0..f-1, val on fold f
+        tr_mask = fold_idx < fold
+        va_mask = fold_idx == fold
+        
+        if tr_mask.sum() == 0 or va_mask.sum() == 0:
+            continue
+        
+        d_tr = xgb.DMatrix(X_tr[tr_mask], label=y_tr[tr_mask])
+        d_va = xgb.DMatrix(X_tr[va_mask], label=y_tr[va_mask])
+        
+        evals_result = {}
+        bst = xgb.train(
+            params=params,
+            dtrain=d_tr,
+            num_boost_round=num_rounds,
+            evals=[(d_va, 'val')],
+            early_stopping_rounds=early_stop,
+            evals_result=evals_result,
+            verbose_eval=False,
+        )
+        fold_results.append({
+            'best_round': bst.best_iteration + 1,
+            'best_rmse': bst.best_score,
+        })
+    
+    return pd.DataFrame(fold_results)
+```
+
+```{python}
+# ── Baseline CV (learning rate sweep to find ballpark) ────────────────────────
+base_params = {
+    "objective": "reg:squarederror",
+    "eta": 0.05,
+    "max_depth": 5,
+    "min_child_weight": 5,
+    "tree_method": "hist",
+    "seed": 42,
+    "nthread": -1,
+}
+
+cv_baseline = temporal_cv_xgb(
+    params=base_params,
+    X_tr=X_train.values,
+    y_tr=y_train.values,
+    fold_idx=fold_idx,
+    n_folds=N_FOLDS,
+    num_rounds=500,
+    early_stop=50,
+)
+
+print("Baseline temporal CV results:")
+print(cv_baseline)
+print(f"\nMean best RMSE: {cv_baseline['best_rmse'].mean():.4f} ± {cv_baseline['best_rmse'].std():.4f}")
+```
+
+```{python}
+# ── Hyperparameter Tuning: max_depth × min_child_weight ───────────────────────
+# NOTE: max_depth kept to 3-7 range — 10 was way too deep for ~800 rows
+depth_mcw_grid = list(ParameterGrid({
+    "max_depth": [3, 5, 7],
+    "min_child_weight": [3, 5, 10],
+}))
+
+depth_results = []
+for p in tqdm(depth_mcw_grid, desc="Depth × MCW Grid CV"):
+    params = base_params.copy()
+    params.update({"max_depth": int(p["max_depth"]), "min_child_weight": int(p["min_child_weight"])})
+    
+    cv_res = temporal_cv_xgb(
+        params=params,
+        X_tr=X_train.values,
+        y_tr=y_train.values,
+        fold_idx=fold_idx,
+        n_folds=N_FOLDS,
+        num_rounds=500,
+        early_stop=50,
+    )
+    
+    depth_results.append({
+        "max_depth": p["max_depth"],
+        "min_child_weight": p["min_child_weight"],
+        "mean_rmse": cv_res['best_rmse'].mean(),
+        "std_rmse": cv_res['best_rmse'].std(),
+        "mean_best_round": cv_res['best_round'].mean(),
+    })
+
+depth_df = pd.DataFrame(depth_results).sort_values('mean_rmse').reset_index(drop=True)
+print(depth_df.head(5))
+best_depth = int(depth_df.iloc[0]['max_depth'])
+best_mcw = int(depth_df.iloc[0]['min_child_weight'])
+print(f"\nBest: max_depth={best_depth}, min_child_weight={best_mcw}")
+```
+
+```{python}
+# ── Hyperparameter Tuning: gamma ──────────────────────────────────────────────
+gamma_grid = [0.0, 0.05, 0.10, 0.20, 0.30]
+
+gamma_results = []
+for g in tqdm(gamma_grid, desc="Gamma CV"):
+    params = base_params.copy()
+    params.update({"max_depth": best_depth, "min_child_weight": best_mcw, "gamma": float(g)})
+    
+    cv_res = temporal_cv_xgb(
+        params=params,
+        X_tr=X_train.values,
+        y_tr=y_train.values,
+        fold_idx=fold_idx,
+        n_folds=N_FOLDS,
+        num_rounds=500,
+        early_stop=50,
+    )
+    
+    gamma_results.append({
+        "gamma": g,
+        "mean_rmse": cv_res['best_rmse'].mean(),
+        "std_rmse": cv_res['best_rmse'].std(),
+    })
+
+gamma_df = pd.DataFrame(gamma_results).sort_values('mean_rmse').reset_index(drop=True)
+print(gamma_df)
+best_gamma = float(gamma_df.iloc[0]['gamma'])
+print(f"\nBest gamma: {best_gamma}")
+```
+
+```{python}
+# ── Hyperparameter Tuning: subsample × colsample_bytree ───────────────────────
+sc_grid = list(ParameterGrid({
+    "subsample":        [0.6, 0.8, 1.0],
+    "colsample_bytree": [0.6, 0.8, 1.0],
+}))
+
+sc_results = []
+for p in tqdm(sc_grid, desc="Subsample × Colsample CV"):
+    params = base_params.copy()
+    params.update({
+        "max_depth": best_depth,
+        "min_child_weight": best_mcw,
+        "gamma": best_gamma,
+        "subsample": float(p["subsample"]),
+        "colsample_bytree": float(p["colsample_bytree"]),
+    })
+    
+    cv_res = temporal_cv_xgb(
+        params=params,
+        X_tr=X_train.values,
+        y_tr=y_train.values,
+        fold_idx=fold_idx,
+        n_folds=N_FOLDS,
+        num_rounds=500,
+        early_stop=50,
+    )
+    
+    sc_results.append({
+        "subsample": p["subsample"],
+        "colsample_bytree": p["colsample_bytree"],
+        "mean_rmse": cv_res['best_rmse'].mean(),
+        "std_rmse": cv_res['best_rmse'].std(),
+    })
+
+sc_df = pd.DataFrame(sc_results).sort_values('mean_rmse').reset_index(drop=True)
+print(sc_df.head(5))
+best_subsample = float(sc_df.iloc[0]['subsample'])
+best_colsample = float(sc_df.iloc[0]['colsample_bytree'])
+print(f"\nBest: subsample={best_subsample}, colsample_bytree={best_colsample}")
+```
+
+```{python}
+# ── Hyperparameter Tuning: Regularization (L1/L2) ────────────────────────────
+reg_grid = list(ParameterGrid({
+    "reg_alpha":  [0.0, 0.1, 0.5, 1.0],
+    "reg_lambda": [1.0, 2.0, 5.0],
+}))
+
+reg_results = []
+for p in tqdm(reg_grid, desc="Regularization CV"):
+    params = base_params.copy()
+    params.update({
+        "max_depth": best_depth,
+        "min_child_weight": best_mcw,
+        "gamma": best_gamma,
+        "subsample": best_subsample,
+        "colsample_bytree": best_colsample,
+        "reg_alpha": float(p["reg_alpha"]),
+        "reg_lambda": float(p["reg_lambda"]),
+    })
+    
+    cv_res = temporal_cv_xgb(
+        params=params,
+        X_tr=X_train.values,
+        y_tr=y_train.values,
+        fold_idx=fold_idx,
+        n_folds=N_FOLDS,
+        num_rounds=500,
+        early_stop=50,
+    )
+    
+    reg_results.append({
+        "reg_alpha": p["reg_alpha"],
+        "reg_lambda": p["reg_lambda"],
+        "mean_rmse": cv_res['best_rmse'].mean(),
+        "std_rmse": cv_res['best_rmse'].std(),
+    })
+
+reg_df = pd.DataFrame(reg_results).sort_values('mean_rmse').reset_index(drop=True)
+print(reg_df.head(5))
+best_alpha = float(reg_df.iloc[0]['reg_alpha'])
+best_lambda = float(reg_df.iloc[0]['reg_lambda'])
+print(f"\nBest: reg_alpha={best_alpha}, reg_lambda={best_lambda}")
+```
+
+```{python}
+# ── Learning Rate Tuning ───────────────────────────────────────────────────────
+# Now that other params are set, find best eta
+eta_grid = [0.03, 0.01, 0.005, 0.001]
+
+eta_curves = []
+eta_summaries = []
+
+for eta in tqdm(eta_grid, desc="Learning Rate CV"):
+    params = base_params.copy()
+    params.update({
+        "eta": float(eta),
+        "max_depth": best_depth,
+        "min_child_weight": best_mcw,
+        "gamma": best_gamma,
+        "subsample": best_subsample,
+        "colsample_bytree": best_colsample,
+        "reg_alpha": best_alpha,
+        "reg_lambda": best_lambda,
+    })
+    
+    cv_res = temporal_cv_xgb(
+        params=params,
+        X_tr=X_train.values,
+        y_tr=y_train.values,
+        fold_idx=fold_idx,
+        n_folds=N_FOLDS,
+        num_rounds=2000,   # allow more rounds for small eta
+        early_stop=100,    # sensible patience — NOT equal to num_rounds
+    )
+    
+    eta_summaries.append({
+        "eta": eta,
+        "mean_rmse": cv_res['best_rmse'].mean(),
+        "std_rmse": cv_res['best_rmse'].std(),
+        "mean_best_round": cv_res['best_round'].mean(),
+    })
+
+eta_df = pd.DataFrame(eta_summaries).sort_values('mean_rmse').reset_index(drop=True)
+print(eta_df)
+best_eta = float(eta_df.iloc[0]['eta'])
+best_rounds = int(eta_df.iloc[0]['mean_best_round'])
+print(f"\nBest eta: {best_eta} | Avg best round: {best_rounds}")
+```
+
+```{python}
+# ── Final Tuned Parameters Summary ───────────────────────────────────────────
+final_params = {
+    "objective": "reg:squarederror",
+    "eta": best_eta,
+    "max_depth": best_depth,
+    "min_child_weight": best_mcw,
+    "gamma": best_gamma,
+    "subsample": best_subsample,
+    "colsample_bytree": best_colsample,
+    "reg_alpha": best_alpha,
+    "reg_lambda": best_lambda,
+    "tree_method": "hist",
+    "seed": 42,
+    "nthread": -1,
+}
+
+print("Final tuned parameters:")
+for k, v in final_params.items():
+    print(f"  {k}: {v}")
+```
+
+```{python}
+# ── Train Final Model on All Training Data ────────────────────────────────────
+model_final = xgb.train(
+    params=final_params,
+    dtrain=dtrain,
+    num_boost_round=best_rounds,
+    evals=[(dtrain, 'train'), (dtest, 'test')],
+    verbose_eval=50,
+)
+
+print("\nFinal model trained.")
+```
+
+```{python}
+# ── Evaluate on 2025 Test Set ─────────────────────────────────────────────────
+y_pred = model_final.predict(dtest)
+y_true = y_test.values
+
+rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+mae  = mean_absolute_error(y_true, y_pred)
+
+print(f"Test RMSE: {rmse:.4f}")
+print(f"Test MAE:  {mae:.4f}")
+
+# Predicted vs Actual plot
+df_eval = pd.DataFrame({'actual': y_true, 'predicted': y_pred})
+
+p_eval = (
+    ggplot(df_eval, aes(x='actual', y='predicted'))
+    + geom_point(alpha=0.4, color='steelblue')
+    + geom_abline(slope=1, intercept=0, linetype='dashed', color='red')
+    + theme_bw()
+    + labs(
+        title='Predicted vs Actual Gap (Scaled) — 2025 Test Set',
+        x='Actual gap_scaled',
+        y='Predicted gap_scaled'
+    )
+)
+display(p_eval)
+```
+
+```{python}
+# ── Residual Plot ─────────────────────────────────────────────────────────────
+df_eval['residual'] = df_eval['actual'] - df_eval['predicted']
+
+p_resid = (
+    ggplot(df_eval, aes(x='predicted', y='residual'))
+    + geom_point(alpha=0.4, color='steelblue')
+    + geom_hline(yintercept=0, linetype='dashed', color='red')
+    + theme_bw()
+    + labs(
+        title='Residuals vs Predicted — 2025 Test Set',
+        x='Predicted gap_scaled',
+        y='Residual (actual - predicted)'
+    )
+)
+display(p_resid)
+```
+
+```{python}
+# ── SHAP Analysis on Final Tuned Model ───────────────────────────────────────
+# NOTE: Running SHAP on the tuned model, not the default baseline
+explainer = shap.TreeExplainer(model_final)
+shap_values = explainer(X_test)
+
+# Summary plot
+f, ax = plt.subplots(figsize=(10, 8))
+shap.summary_plot(shap_values, X_test, show=False)
+plt.tight_layout()
+f.savefig('shap_summary.png', dpi=1200, bbox_inches='tight')
+plt.show()
+```
+
+```{python}
+# ── SHAP Waterfall for a Single Prediction ───────────────────────────────────
+# Show the explanation for the first test prediction
+shap.waterfall_plot(shap_values[0])
+```
+
+```{python}
+# ── Feature Importance (Gain) ────────────────────────────────────────────────
+importance = model_final.get_score(importance_type='gain')
+imp_df = (
+    pd.DataFrame({'feature': list(importance.keys()), 'gain': list(importance.values())})
+    .sort_values('gain', ascending=False)
+    .head(20)
+    .reset_index(drop=True)
+)
+
+p_imp = (
+    ggplot(imp_df, aes(x='reorder(feature, gain)', y='gain'))
+    + geom_col(fill='steelblue')
+    + coord_flip()
+    + theme_bw()
+    + labs(
+        title='Top 20 Features by XGBoost Gain',
+        x='Feature',
+        y='Gain'
+    )
+)
+display(p_imp)
+```
+
+```{python}
+# ── Save Model Artifacts for Inference ───────────────────────────────────────
+import pickle
+import json
+
+# 1. Save the XGBoost model
+model_final.save_model('f1_model.json')
+
+# 2. Save the imputer (fitted on training data — must NOT refit at inference)
+with open('f1_imputer.pkl', 'wb') as f:
+    pickle.dump(imputer, f)
+
+# 3. Save the exact feature columns and order
+#    Critical — OHE dummies for new circuits must align to training columns
+feature_cols = X_imputed.columns.tolist()
+with open('f1_feature_cols.json', 'w') as f:
+    json.dump(feature_cols, f)
+
+# 4. Save the last 5 races of driver/team history from training data
+#    Inference needs this to seed the rolling features for new race entries
+history_cols = ['DriverId', 'TeamId', 'Season', 'Round', 'Position', 'Points', 'Status']
+last_5_races = (
+    df[df['Season'] < 2025]
+    .sort_values(['Season', 'Round'])
+    .groupby('DriverId')
+    .tail(5)
+    [history_cols]
+    .reset_index(drop=True)
+)
+last_5_races.to_csv('f1_driver_history.csv', index=False)
+
+print("Artifacts saved:")
+print("  f1_model.json         — trained XGBoost model")
+print("  f1_imputer.pkl        — fitted SimpleImputer")
+print("  f1_feature_cols.json  — feature column names and order")
+print("  f1_driver_history.csv — last 5 races per driver/team for rolling features")
+```
+
+```{python}
+# ── Inference: Predict from New Race CSV ─────────────────────────────────────
+# Set the path to your input CSV here, then run this cell.
+# Input CSV must have the columns defined in REQUIRED_COLUMNS below.
+# All training artifacts must be saved (run the save block above first).
+
+PREDICT_INPUT_PATH  = 'azerbaijan_2025_predict.csv'   # <-- change this
+PREDICT_OUTPUT_PATH = 'predictions.csv'
+
+REQUIRED_COLUMNS = [
+    'DriverId', 'TeamId', 'FullName', 'Season', 'Round',
+    'GridPosition', 'AvgQualiTime',
+    'AirTemp_C', 'TrackTemp_C', 'Humidity_%', 'Pressure_hPa',
+    'WindSpeed_mps', 'WindDirection_deg',
+    'circuit_name', 'track_length_km', 'num_corners', 'num_slow_corners',
+    'num_high_speed_corners', 'clockwise', 'avg_lap_time_sec', 'track_type',
+    'drs_zones', 'elevation_change_m', 'full_throttle_pct', 'avg_speed_kmh',
+    'longest_straight_m', 'is_street_circuit', 'has_banked_corners',
+    'tyre_degradation', 'overtaking_difficulty', 'num_race_laps', 'altitude_m',
+    'pit_lane_time_loss_sec', 'sc_probability_pct', 'avg_overtakes_per_race',
+    'avg_race_temp_c', 'surface_abrasiveness', 'track_width_m', 'typical_pit_stops',
+    'kmeans',
+]
+```
+
+```{python}
+# ── Load Artifacts ────────────────────────────────────────────────────────────
+import pickle, json
+
+infer_model = xgb.Booster()
+infer_model.load_model('f1_model.json')
+
+with open('f1_imputer.pkl', 'rb') as f:
+    infer_imputer = pickle.load(f)
+
+with open('f1_feature_cols.json', 'r') as f:
+    infer_feature_cols = json.load(f)
+
+infer_history = pd.read_csv('f1_driver_history.csv')
+
+print("Artifacts loaded.")
+```
+
+```{python}
+# ── Load & Validate Input CSV ─────────────────────────────────────────────────
+new_df = pd.read_csv(PREDICT_INPUT_PATH)
+
+missing = [c for c in REQUIRED_COLUMNS if c not in new_df.columns]
+if missing:
+    raise ValueError(f"Input CSV is missing required columns: {missing}")
+
+print(f"Input validated: {len(new_df)} driver entries found.")
+print(new_df[['FullName', 'GridPosition', 'AvgQualiTime']].to_string())
+```
+
+```{python}
+# ── Quali Gap Feature ─────────────────────────────────────────────────────────
+infer_scaler = MinMaxScaler()
+
+def infer_add_quali_gap(group):
+    pole = group.loc[group['GridPosition'] == 1.0, 'AvgQualiTime'].values
+    if len(pole) > 0 and not pd.isna(pole[0]):
+        group['AvgQualiTime_gap'] = group['AvgQualiTime'] - pole[0]
+    else:
+        group['AvgQualiTime_gap'] = float('nan')
+    return group
+
+def infer_scale_quali_gap(group):
+    mask = ~group['AvgQualiTime_gap'].isna()
+    vals = group.loc[mask, 'AvgQualiTime_gap'].values.reshape(-1, 1)
+    if mask.sum() > 1:
+        group.loc[mask, 'AvgQualiTime_gap_scaled'] = infer_scaler.fit_transform(vals).flatten()
+    else:
+        group['AvgQualiTime_gap_scaled'] = float('nan')
+    return group
+
+new_df = new_df.groupby(['Season', 'Round'], group_keys=False).apply(infer_add_quali_gap)
+new_df = new_df.groupby(['Season', 'Round'], group_keys=False).apply(infer_scale_quali_gap)
+```
+
+```{python}
+# ── Rolling Driver & Team Features ───────────────────────────────────────────
+# Append new race rows to saved history, compute rolling stats with shift(1),
+# then extract only the new race rows — avoids leakage.
+
+infer_new = new_df.copy()
+for col in ['Position', 'Points', 'Status']:
+    if col not in infer_new.columns:
+        infer_new[col] = float('nan')
+
+combined = pd.concat([infer_history, infer_new], ignore_index=True)
+combined['finished_flag'] = (combined['Status'] == 'Finished').astype(float)
+combined = combined.sort_values(['Season', 'Round']).reset_index(drop=True)
+
+combined['driver_avg_finish_5'] = (
+    combined.groupby('DriverId')['Position']
+    .transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
+)
+combined['driver_dnf_rate_5'] = (
+    combined.groupby('DriverId')['finished_flag']
+    .transform(lambda x: 1 - x.shift(1).rolling(5, min_periods=1).mean())
+)
+combined['driver_avg_points_5'] = (
+    combined.groupby('DriverId')['Points']
+    .transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
+)
+combined['team_avg_finish_5'] = (
+    combined.groupby('TeamId')['Position']
+    .transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
+)
+combined['team_avg_points_5'] = (
+    combined.groupby('TeamId')['Points']
+    .transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
+)
+
+new_season = infer_new['Season'].iloc[0]
+new_round  = infer_new['Round'].iloc[0]
+new_df = combined[(combined['Season'] == new_season) & (combined['Round'] == new_round)].copy()
+
+print("Rolling features computed.")
+```
+
+```{python}
+# ── One-Hot Encode & Align to Training Columns ────────────────────────────────
+new_df = pd.get_dummies(new_df, columns=['circuit_name', 'track_type'], dtype=int)
+
+# Drop columns not in model feature set
+infer_drop = [
+    'DriverId', 'TeamId', 'FullName', 'Season', 'Round',
+    'AvgQualiTime', 'AvgQualiTime_gap',
+    'Position', 'Points', 'Status', 'finished_flag',
+]
+new_df = new_df.drop(columns=[c for c in infer_drop if c in new_df.columns])
+
+# Add any missing OHE columns (e.g. circuits not in this race) as 0, drop extras
+for col in infer_feature_cols:
+    if col not in new_df.columns:
+        new_df[col] = 0
+new_df = new_df[infer_feature_cols]  # enforce exact column order
+
+# Impute using training-fitted imputer (transform only — NOT fit_transform)
+X_new = pd.DataFrame(
+    infer_imputer.transform(new_df),
+    columns=infer_feature_cols
+)
+
+print(f"Feature matrix shape: {X_new.shape}")
+```
+
+```{python}
+# ── Predict & Output ──────────────────────────────────────────────────────────
+dmat_new = xgb.DMatrix(X_new.values)
+preds    = infer_model.predict(dmat_new)
+
+# Reload input to grab identifiers for output
+id_df = pd.read_csv(PREDICT_INPUT_PATH)[['FullName', 'DriverId', 'Season', 'Round', 'GridPosition']]
+id_df = id_df.reset_index(drop=True)
+
+output = id_df.copy()
+output['predicted_gap_scaled'] = preds
+output['predicted_finish_rank'] = output['predicted_gap_scaled'].rank().astype(int)
+output = output.sort_values('predicted_finish_rank').reset_index(drop=True)
+
+output.to_csv(PREDICT_OUTPUT_PATH, index=False)
+
+print(f"Predictions saved to: {PREDICT_OUTPUT_PATH}\n")
+display(output[['predicted_finish_rank', 'FullName', 'GridPosition', 'predicted_gap_scaled']])
+```
