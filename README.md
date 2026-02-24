@@ -78,11 +78,15 @@ COTA: podium predicted exactly (Verstappen, Norris, Leclerc). Variance driven by
 ## Repo Structure
 
 ```
-├── ClusteringModel.py          # K-Means + HDBSCAN circuit clustering, PCA + UMAP visualization
-├── merge_clusters.py           # Merges cluster labels into main race results dataset
-├── F1Pipeline.qmd              # Full XGBoost pipeline — feature engineering, model training, SHAP analysis
-├── ClusteredResults.csv        # Race results (2023–2025) with circuit characteristics and cluster labels
-├── azerbaijan_2025_predict.csv # Model input for 2025 Azerbaijan GP prediction
+├── ClusteringModel.py              # K-Means + HDBSCAN circuit clustering, PCA + UMAP visualization
+├── merge_clusters.py               # Merges cluster labels into main race results dataset
+├── FinalF1Pipeline.qmd             # Full XGBoost pipeline — feature engineering, model training, SHAP analysis
+├── FinalMergedWithCircuits.csv     # Base dataset — race results merged with raw circuit characteristics
+├── ClusteredResults.csv            # Race results (2023–2025) with circuit characteristics and cluster labels
+├── azerbaijan_2025_predict.csv     # Model input for 2025 Azerbaijan GP prediction
+├── cota_2025_predict.csv           # Model input for 2025 United States GP prediction
+├── abu_dhabi_2025_predict.csv      # Model input for 2025 Abu Dhabi GP prediction
+└── docs/                           # Research paper and presentation slides
 ```
 
 ---
@@ -109,7 +113,7 @@ plotnine
 
 ### Step 1 — Run the Clustering Model
 
-`ClusteringModel.py` expects a file called `FinalMergedWithCircuits.csv` in the working directory. This is the base dataset of race results merged with circuit characteristics. It aggregates circuit features by median, normalizes them, runs PCA, and outputs two cluster label columns: `kmeans` (6 clusters) and `hdbscan`.
+`ClusteringModel.py` expects a file called `FinalMergedWithCircuits.csv` in the working directory — this is already included in the repo. It aggregates circuit features by median, normalizes them, runs PCA, and outputs two cluster label columns: `kmeans` (6 clusters) and `hdbscan`.
 
 ```bash
 python ClusteringModel.py
@@ -125,7 +129,7 @@ Outputs:
 
 ### Step 2 — Merge Cluster Labels into the Race Results
 
-`merge_clusters.py` joins the cluster labels from `circuit_clusters.csv` back onto `FinalMergedWithCircuits.csv`, matching on `circuit_id` and `circuit_name`.
+`merge_clusters.py` joins the cluster labels from `circuit_clusters.csv` back onto `FinalMergedWithCircuits.csv` (already included in the repo), matching on `circuit_id` and `circuit_name`.
 
 ```bash
 python merge_clusters.py
@@ -140,10 +144,10 @@ Rename this file to `ClusteredResults.csv` (or update the path in the pipeline) 
 
 ### Step 3 — Run the Prediction Pipeline
 
-`F1Pipeline.qmd` is a Quarto notebook that handles everything from feature engineering to model training and evaluation. It expects `ClusteredResults.csv` in the working directory.
+`FinalF1Pipeline.qmd` is a Quarto notebook that handles everything from feature engineering to model training and evaluation. It expects `ClusteredResults.csv` in the working directory.
 
 ```bash
-quarto render F1Pipeline.qmd
+quarto render FinalF1Pipeline.qmd
 ```
 
 Or run interactively cell-by-cell in VS Code with the Quarto extension.
@@ -165,7 +169,7 @@ Outputs: `shap_summary.png` and rendered HTML report.
 
 ### Making a Prediction for a New Race
 
-To generate predictions for an upcoming race, build an input CSV matching the structure of `azerbaijan_2025_predict.csv`. Each row is one driver with their grid position, qualifying time, weather conditions, and circuit characteristics for that round. The `kmeans` cluster for the circuit must be looked up from `circuit_clusters.csv` and included as a column.
+To generate predictions for an upcoming race, build an input CSV matching the structure of the prediction CSVs included in the repo (`azerbaijan_2025_predict.csv`, `cota_2025_predict.csv`, `abu_dhabi_2025_predict.csv`). Each row is one driver with their grid position, qualifying time, weather conditions, and circuit characteristics for that round. The `kmeans` cluster for the circuit must be looked up from `circuit_clusters.csv` and included as a column.
 
 Feed the CSV into the trained model by loading it as a DMatrix and calling `model_final.predict()`. Sort predicted gaps ascending to get the finishing order.
 
