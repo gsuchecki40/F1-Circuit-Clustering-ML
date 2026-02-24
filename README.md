@@ -113,7 +113,7 @@ plotnine
 
 ### Step 1 — Run the Clustering Model
 
-`ClusteringModel.py` expects a file called `FinalMergedWithCircuits.csv` in the working directory — this is already included in the repo. It aggregates circuit features by median, normalizes them, runs PCA, and outputs two cluster label columns: `kmeans` (6 clusters) and `hdbscan`.
+`ClusteringModel.py` expects a file called `FinalMergedWithCircuits.csv` in the working directory — this is already included in the repo and will be updated after the first few races of the 2026 season. It aggregates circuit features by median, normalizes them, runs PCA, and outputs two cluster label columns: `kmeans` (6 clusters) and `hdbscan`.
 
 ```bash
 python ClusteringModel.py
