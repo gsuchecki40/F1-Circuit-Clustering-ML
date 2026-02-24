@@ -6,6 +6,12 @@ This is an ongoing project. The current iteration focuses on incorporating circu
 
 ---
 
+## Research Paper
+
+A full writeup of the methodology, clustering approach, SHAP analysis, and validation results is included in `F1_Clustering_Report.pdf`. If you want the reasoning behind design decisions or a deeper look at what the model is actually doing, start there.
+
+---
+
 ## How It Works
 
 Rather than treating every circuit the same, the model first groups all 24 circuits on the calendar into 6 distinct track types using K-Means clustering. Each cluster is defined by layout and racing characteristics — corner profiles, average speed, tyre degradation, safety car probability, altitude, and more. That cluster assignment then feeds into the XGBoost model as a feature alongside driver and race data.
